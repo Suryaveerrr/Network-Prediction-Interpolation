@@ -27,10 +27,7 @@ inline sf::Vector2f Lerp(sf::Vector2f v0, sf::Vector2f v1, float t)
 	return v0 * (1.f - t) + v1 * t;
 }
 
-// Fixme:: ideally we should link specific tank/character to each connection,
-// rather than assuming the order in which connections are made is the same as
-// the order in which tanks/characters are stored in the game.
-
+// Everything the Observer knows about one connected player, including which tank is theirs.
 // This could also be made int oa class, given the increased functionality.
 struct Connection
 {
@@ -44,6 +41,15 @@ struct Connection
 
 	std::unique_ptr<sf::TcpSocket> socket;
 	ConnState state = Disconnected;
+
+	// ID of this player's tank in the Game. It stays -1 until the player's first message arrives and we
+	// know where the tank is. We use this instead of assuming the order of connections matches the order
+	// of tanks, because connections get removed and the order changes.
+	int tankId = -1;
+
+	// Packets waiting to be sent to this player. Sockets are non-blocking, so a send may only take part
+	// of a packet. A packet stays at the front until it has gone out completely.
+	std::deque<sf::Packet> outbox;
 
 	std::deque<TankMessage> message_history; // Newest message at the front.
 	float inter_t = 0.f; // This value goes from 0.f to 1.f during interpolation and will be accumulated based on time delta.

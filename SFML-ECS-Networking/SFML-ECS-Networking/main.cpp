@@ -1,5 +1,7 @@
 #include <SFML\Graphics.hpp>
 #include <SFML\Network.hpp>
+#include <algorithm>
+#include <deque>
 #include <sstream>
 #include <iomanip>
 #include "game.h"
@@ -38,10 +40,24 @@ static const char* PredictionName(PredictionMethod method) {
 	}
 }
 
+// Sends as much of the queue as the socket will take right now, front to back. A packet is only removed
+// once it has been sent completely. If the socket takes only part of it (Partial) or none of it
+// (NotReady), we stop. The same, unchanged packet is then sent again next time, and SFML carries on from
+// where it left off. Returns Done if the queue is empty, otherwise the status that stopped us.
+static sf::Socket::Status FlushOutbox(sf::TcpSocket& socket, std::deque<sf::Packet>& outbox)
+{
+	while (!outbox.empty()) {
+		sf::Socket::Status status = socket.send(outbox.front());
+		if (status != sf::Socket::Status::Done)
+			return status;
+		outbox.pop_front();
+	}
+	return sf::Socket::Status::Done;
+}
+
 int main() {
 	bool is_observer = false;
 	unsigned short observer_port = 53000;
-	unsigned short player_port = sf::Socket::AnyPort;
 
 	Utils::printMsg("Game startup...");
 
@@ -90,11 +106,17 @@ int main() {
 	// Socket for communication with observer
 	std::unique_ptr<sf::TcpSocket> player_socket = std::make_unique<sf::TcpSocket>();
 
-	auto port = is_observer ? observer_port : player_port;
-	listener.setBlocking(false); // set listener to non-blocking mode so we can keep checking for connections
+	// Only the Observer listens for connections. Players connect to it, so they don't need a listener.
+	if (is_observer) {
+		listener.setBlocking(false); // set listener to non-blocking mode so we can keep checking for connections
 
-	if (listener.listen(port) == sf::Socket::Status::Error) {
-		// FIXME: we need to handle the error and make sure we don't try to accept, etc. if the listen fails.
+		// Without a listener the Observer can never accept a Player, so there is no point carrying on.
+		if (listener.listen(observer_port) != sf::Socket::Status::Done) {
+			Utils::printMsg("Could not listen on port " + std::to_string(observer_port)
+				+ ". Is another Observer already running?", error);
+			return 1;
+		}
+		Utils::printMsg("Listening on port " + std::to_string(observer_port));
 	}
 
 	// Clock for timing the 'dt' value
@@ -104,6 +126,11 @@ int main() {
 
 	// Game object.
 	Game game;
+
+	// A Player has its own tank from the start, so it can drive even before it has connected.
+	if (!is_observer)
+		game.SetLocalTank(game.AddTank("body_blue", "barrel_black", { 320, 240 }));
+
 	// Container of player connections for Observer.
 	std::vector<Connection> player_connections;
 
@@ -113,8 +140,15 @@ int main() {
 	int send_rate_index = 0;
 	float send_rate = send_rates[send_rate_index];
 	float reconnect_delay = 1.f;
+	float reconnect_timer = reconnect_delay; // Start "due", so the first attempt happens straight away.
 	float send_timer = 1.f;
 	bool is_connected = false;
+
+	// Player: whether we have adopted the Observer's clock yet, and the packets waiting to go to the
+	// Observer (with a limit on how many we let build up if the connection is struggling).
+	bool clock_synced = false;
+	std::deque<sf::Packet> outbox;
+	const std::size_t max_queued_updates = 4;
 
 	// How the Observer works out where to draw tanks. Change them with the number keys while running.
 	SmoothingMode smoothing_mode = PredictAndInterpolate;
@@ -122,6 +156,42 @@ int main() {
 
 	// Selector for handling multiple connections (Observer only).
 	sf::SocketSelector selector;
+
+	// Observer: stops dealing with a player (they left, or their connection broke) and removes their tank.
+	// The connection itself is erased from the vector at the end of the frame.
+	auto drop_connection = [&](Connection& connection, sf::Socket::Status why) {
+		// Work out who this was before we close the socket (the address is gone afterwards).
+		auto remote_address = connection.socket->getRemoteAddress();
+		std::string who = remote_address
+			? remote_address->toString() + ":" + std::to_string(connection.socket->getRemotePort())
+			: "unknown address";
+
+		if (why == sf::Socket::Status::Disconnected)
+			Utils::printMsg("Player disconnected: " + who, warning);
+		else
+			Utils::printMsg("Connection error, dropping player: " + who, error);
+
+		// Stop watching the socket (before closing it, the selector needs the handle), then close it.
+		// A closed connection always counts as "ready", so leaving it in the selector would flag it
+		// every frame.
+		selector.remove(*connection.socket);
+		connection.socket->disconnect();
+		connection.state = Disconnected;
+
+		// Remove their tank, so it is no longer updated or drawn.
+		if (connection.tankId >= 0)
+			game.RemoveTank(connection.tankId);
+		};
+
+	// Player: the connection to the Observer has broken. Go back to trying to connect.
+	auto lose_connection = [&](const std::string& reason) {
+		Utils::printMsg(reason + " Will try to reconnect.", error);
+		player_socket->disconnect();
+		is_connected = false;
+		clock_synced = false;
+		outbox.clear();
+		reconnect_timer = 0;
+		};
 
 	while (window.isOpen()) {
 		// Calculate dt.
@@ -140,6 +210,7 @@ int main() {
 		text.setString(overlay);
 
 		send_timer += dt;
+		reconnect_timer += dt;
 		// Handle window events (e.g. key press).
 		while (const std::optional event = window.pollEvent()) {
 			if (event->is<sf::Event::Closed>()) {
@@ -180,8 +251,6 @@ int main() {
 			if (!is_observer)
 				game.HandleEvents(event);
 		}
-		// Packet to hold our updates.
-		sf::Packet packet;
 
 		if (is_observer) { // OBSERVER
 			// Socket for communication with player
@@ -201,151 +270,223 @@ int main() {
 				// Set the deafult connection state to NotReady.
 				player_connections.back().state = NotReady;
 
-				// Add new tank with blue body and black barrel at the centre of the window.
-				// FIXME: Ideally we should wait until the first receive gets some data about the tank
-				// position and colour before we add it to the Observer's game.
-				game.AddTank("body_blue", "barrel_black", { 320, 240 });
+				// There is no tank yet: it is added when the player's first message arrives, so it starts
+				// where the player's tank really is. (The colour isn't part of these messages, so the tank
+				// is always blue. Lab 5 sends it in a separate message.)
 
-				//This is a bit of a hack, we want to reset the game time when the first player connects to "sync up the game clocks".
-				// FIXME: This will only work for the first player. As more player connect, they will be out of sync with the game time. 
-				//		  We should handle this better, e.g. by sending the current game time to the new player and having them start from 
-				//		  that time.
-				if (player_connections.size() == 1)
-					game_time = 0.f;
-
+				// Tell the new player what time it is on our clock, so every player's timestamps share the
+				// Observer's time (this replaces the old trick of resetting the clock when the first player
+				// connected, which only worked for that one player). It ignores how long the message takes to
+				// arrive, which is tiny here. Over a real network you would take off about half the round trip.
+				sf::Packet welcome;
+				welcome << game_time;
+				player_connections.back().outbox.push_back(welcome);
 			}
 
 			// Reset states before waiting to avoid stale Ready state causing a blocking receive.
-			for (size_t i = 0; i < player_connections.size(); ++i)
-				player_connections[i].state = NotReady;
+			// Disconnected is final, so those connections are left alone.
+			for (size_t i = 0; i < player_connections.size(); ++i) {
+				if (player_connections[i].state != Disconnected)
+					player_connections[i].state = NotReady;
+			}
 
 			// Check which connections have some data waiting to be received from sockets.
 			if (selector.wait(sf::milliseconds(5))) {
 				// If at least one of the sockets is ready to receive, check which ones are ready.
-				for (int i = 0; i < player_connections.size(); i++) {
-					if (selector.isReady(*player_connections[i].socket))
+				for (size_t i = 0; i < player_connections.size(); i++) {
+					// Check the state first: a disconnected socket has been removed from the selector
+					// and closed, so we must not ask the selector about it.
+					if (player_connections[i].state != Disconnected && selector.isReady(*player_connections[i].socket))
 						player_connections[i].state = Ready;
 				}
 			}
 
-			// FIXME: we never remove disconnected players from the vector of connections. This will
-			// cause us to continue to update and draw them. Handle disconnections and fix this.
-			for (int i = 0; i < player_connections.size(); i++) {
-				// FIXME: Recieve can fail, check for errors.
-				if (player_connections[i].state == Ready) {
-					sf::Socket::Status status = player_connections[i].socket->receive(packet);
-					if (status == sf::Socket::Status::Done) {
+			for (size_t i = 0; i < player_connections.size(); i++) {
+				Connection& connection = player_connections[i];
+
+				if (connection.state == Ready) {
+					// Read everything that has arrived on this socket.
+					while (true) {
+						sf::Packet packet;
+						sf::Socket::Status status = connection.socket->receive(packet);
+
+						if (status == sf::Socket::Status::Disconnected || status == sf::Socket::Status::Error) {
+							// The player left or the connection broke: remove them and their tank.
+							drop_connection(connection, status);
+							break;
+						}
+						if (status != sf::Socket::Status::Done) {
+							// NotReady means nothing more to read. Partial means only part of a packet has
+							// arrived, and SFML keeps what it has until the rest shows up on a later receive.
+							break;
+						}
 #ifdef DEBUG
 						Utils::printMsg("Recieved message from: "
-							+ player_connections[i].socket->getRemoteAddress().value().toString()
+							+ connection.socket->getRemoteAddress().value().toString()
 							+ ":"
-							+ std::to_string(player_connections[i].socket->getRemotePort()));
+							+ std::to_string(connection.socket->getRemotePort()));
 #endif // DEBUG
 						TankMessage message;
-						message.id = i;
-						// Read recieved data into TankMessage struct.
-						// FIXME: reading from packet can fail. Refer to documentation on how to
-						// handle errors and add error checking here.
-						packet >> message.time >> message.position.x >> message.position.y;
+						// Read recieved data into TankMessage struct. Reading can fail if the packet is
+						// too short, so check it before using the values.
+						if (!(packet >> message.time >> message.position.x >> message.position.y)) {
+							Utils::printMsg("Malformed packet from a player, ignoring it.", warning);
+							continue;
+						}
+
+						// The first message gives us the tank's real position, so add the tank now.
+						if (connection.tankId < 0) {
+							connection.tankId = game.AddTank("body_blue", "barrel_black", message.position);
+							Utils::printMsg("Player " + std::to_string(connection.tankId) + " joined.", success);
+						}
+						// The connection knows which tank is its own, so we don't rely on its position in the vector.
+						message.id = connection.tankId;
 
 						// Store the message in the message_history (this also restarts the interpolation
 						// and prediction timers, and starts the correction glide).
-						player_connections[i].AddMessage(message);
+						connection.AddMessage(message);
 #ifdef DEBUG
 						//For DEBUG ONLY, pring current message history. Remove this when no longer needed!
 						std::string history_msg = "Current queue: \n";
-						for (int m = 0; m < player_connections[i].message_history.size(); m++) {
+						for (size_t m = 0; m < connection.message_history.size(); m++) {
 							history_msg.append("\t\t{ Time: ");
-							history_msg.append(std::to_string(player_connections[i].message_history[m].time));
+							history_msg.append(std::to_string(connection.message_history[m].time));
 							history_msg.append(", X: ");
-							history_msg.append(std::to_string(player_connections[i].message_history[m].position.x));
+							history_msg.append(std::to_string(connection.message_history[m].position.x));
 							history_msg.append(", Y: ");
-							history_msg.append(std::to_string(player_connections[i].message_history[m].position.y));
+							history_msg.append(std::to_string(connection.message_history[m].position.y));
 							history_msg.append(" }");
-							if (m != (player_connections[i].message_history.size() - 1))
+							if (m != (connection.message_history.size() - 1))
 								history_msg.append("\n");
 						}
 
 						Utils::printMsg(history_msg, MessageType::debug);
 #endif // DEBUG
 					}
-					else if (status == sf::Socket::Status::Disconnected) {
-						Utils::printMsg("Player disconnected: "
-							+ player_connections[i].socket->getRemoteAddress().value().toString()
-							+ ":"
-							+ std::to_string(player_connections[i].socket->getRemotePort()), warning);
-
-						// For now just set the connection state to Disconnected. 
-						// FIXME: But we should also remove the inactive connection from the vector and remove the tank from the game.
-						player_connections[i].state = Disconnected;
-					}
 				}
+
 				// NOTE: Moved player update here, as we want to update every time, not just when we recieve messages.
-				if (!player_connections[i].message_history.empty()) {
+				if (connection.state != Disconnected && !connection.message_history.empty()) {
 #ifdef DEBUG
-					Utils::printMsg("dt = " + std::to_string(dt) + ", Inter t = " + std::to_string(player_connections[i].inter_t), MessageType::info);
+					Utils::printMsg("dt = " + std::to_string(dt) + ", Inter t = " + std::to_string(connection.inter_t), MessageType::info);
 #endif // DEBUG
 					// Get the position to draw, using the interpolation / prediction method chosen with the keys.
-					sf::Vector2f display_pos = player_connections[i].GetDisplayPosition(dt, smoothing_mode, prediction_method);
+					sf::Vector2f display_pos = connection.GetDisplayPosition(dt, smoothing_mode, prediction_method);
 
 					// Construct message with actual positon.
 					TankMessage display_msg = {
 						game_time,
-						player_connections[i].message_history[0].id,
+						connection.tankId,
 						display_pos
 					};
 					// Update game using message containign actual position update.
 					game.NetworkUpdate(dt, display_msg);
 				}
 			}
+
+			// Send out whatever is queued for each player (for now, just the welcome with our clock).
+			for (auto& connection : player_connections) {
+				if (connection.state == Disconnected || connection.outbox.empty())
+					continue;
+
+				sf::Socket::Status status = FlushOutbox(*connection.socket, connection.outbox);
+				if (status == sf::Socket::Status::Disconnected || status == sf::Socket::Status::Error)
+					drop_connection(connection, status);
+				// Partial and NotReady: the packet at the front stays queued and is sent again next frame.
+			}
+
+			// Disconnected players' sockets are closed and out of the selector, and their tanks are
+			// gone from the game, so now it is safe to drop their connections from the vector too.
+			player_connections.erase(
+				std::remove_if(player_connections.begin(), player_connections.end(),
+					[](const Connection& connection) { return connection.state == Disconnected; }),
+				player_connections.end());
 		}
 		else // PLAYER
 		{
-			// If we're not connected to the observer, try to connect.
-			// We want the socket in non-blocking mode, so if the connection fails, we just try again next time.
-			if (!is_connected) {
-				Utils::printMsg("Attempting connection to observer...");
-				// SFML TCP sockets are fiddly when it comes to non-blocking connect calls,
-				// we could specify a very small delay timeout in the blocking mode, but this would cause lag while it tries.
-				// Ideally, we just handle connection in blocking mode, and wait for a successful connection before we continue.
-				sf::Socket::Status status = player_socket->connect(sf::IpAddress::LocalHost, observer_port);
-				if (status == sf::Socket::Status::Done) {
-					Utils::printMsg("Connected!", MessageType::success);
-					is_connected = true;
-					// Add new tank with blue body and black barrel at the centre of the window.
-					game.AddTank("body_blue", "barrel_black", { 320, 240 });
-				}
-				else {
-					Utils::printMsg("Failed to connect to observer. Will try again later.", MessageType::warning);
-				}
-				send_timer = 0;
-			}
-			else {
-				game.Update(dt);
-				// Get data structure from game, containing update message.
-				TankMessage message = game.GetNetworkUpdate();
-				// Add current game time to the message
-				message.time = game_time;
-				// Translate our messgage struct to sf::Packet (very rudimentary conversion).
-				packet << message.time << message.position.x << message.position.y;
+			// The Player's own tank is always updated, connected or not.
+			game.Update(dt);
 
-				// Send messages only as often as the send rate allows.
-				if (send_timer >= send_rate) {
-					sf::Socket::Status status = player_socket->send(packet);
-					// FIXME: Send can fail, check for errors and adjust logic accordingly.
+			// If we're not connected to the observer, try to connect.
+			if (!is_connected) {
+				// Only try once per reconnect_delay, instead of on every single frame.
+				if (reconnect_timer >= reconnect_delay) {
+					reconnect_timer = 0;
+
+					Utils::printMsg("Attempting connection to observer...");
+					// SFML TCP sockets are fiddly when it comes to non-blocking connect calls,
+					// we could specify a very small delay timeout in the blocking mode, but this would cause lag while it tries.
+					// Ideally, we just handle connection in blocking mode, and wait for a successful connection before we continue.
+					// So switch to blocking mode for each attempt (we go non-blocking again once connected).
+					player_socket->setBlocking(true);
+					sf::Socket::Status status = player_socket->connect(sf::IpAddress::LocalHost, observer_port);
 					if (status == sf::Socket::Status::Done) {
-#ifdef DEBUG
-						Utils::printMsg("Sent message to: "
-							+ player_socket->getRemoteAddress().value().toString()
-							+ ":"
-							+ std::to_string(observer_port));
-#endif // DEBUG
+						Utils::printMsg("Connected!", MessageType::success);
+						is_connected = true;
+						// From now on neither sending nor receiving may hold up the game loop.
+						player_socket->setBlocking(false);
+						// We start sending once we have the Observer's clock.
+						clock_synced = false;
+						outbox.clear();
 					}
 					else {
-						Utils::printMsg("Failed to send message to Observer", error);
+						Utils::printMsg("Failed to connect to observer. Will try again later.", MessageType::warning);
 					}
-					// Reset timer after sending the message
-					send_timer = 0;
+				}
+			}
+			else {
+				// Listen for the Observer's welcome message, which carries the time on its clock.
+				while (is_connected) {
+					sf::Packet incoming;
+					sf::Socket::Status status = player_socket->receive(incoming);
+
+					if (status == sf::Socket::Status::Disconnected || status == sf::Socket::Status::Error) {
+						lose_connection("Lost connection to Observer.");
+						break;
+					}
+					if (status != sf::Socket::Status::Done)
+						break; // NotReady, or only part of a packet so far: nothing more to read right now.
+
+					float observer_time;
+					if (!(incoming >> observer_time)) {
+						Utils::printMsg("Malformed message from the Observer, ignoring it.", warning);
+						continue;
+					}
+
+					// Adopt the Observer's clock, so all of our timestamps are on the same time scale as
+					// every other player's.
+					game_time = observer_time;
+					clock_synced = true;
+					Utils::printMsg("Clock synced to the Observer.", MessageType::success);
+				}
+
+				// Don't send anything until we have the Observer's clock, or our timestamps would
+				// jump when it arrives.
+				if (is_connected && clock_synced) {
+					// Send messages only as often as the send rate allows. We keep sending even when the
+					// tank isn't moving, because the Observer's prediction needs to hear that it has stopped.
+					// If a lot is already queued the connection is struggling, so hold back and send the
+					// newest position once it catches up.
+					if (send_timer >= send_rate && outbox.size() < max_queued_updates) {
+						// Get data structure from game, containing update message.
+						TankMessage message = game.GetNetworkUpdate();
+						// Add current game time to the message
+						message.time = game_time;
+						// Translate our messgage struct to sf::Packet (very rudimentary conversion).
+						sf::Packet packet;
+						packet << message.time << message.position.x << message.position.y;
+						outbox.push_back(packet);
+						// Reset timer after queueing the message
+						send_timer = 0;
+					}
+				}
+
+				if (is_connected) {
+					// Send what we can. A Partial or NotReady result means the packet at the front of the
+					// queue is only part-way out, so it stays queued and is sent again next frame.
+					sf::Socket::Status status = FlushOutbox(*player_socket, outbox);
+					if (status == sf::Socket::Status::Disconnected || status == sf::Socket::Status::Error)
+						lose_connection("Lost connection to Observer.");
 				}
 			}
 		}
