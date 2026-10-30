@@ -15,13 +15,33 @@
  The player connects to the Observer, and sends updates about its tank position.
  The Observer accepts multiple connections from players, receives their tank position updates,
  and interpolates the tank positions based on message history to provide smooth movement.
+ It can also predict where each tank is right now, from the last few positions.
+
+ Keys on the Observer:  1 = interpolation only, 2 = prediction only, 3 = prediction and interpolation,
+						4 = no prediction, 5 = linear prediction, 6 = quadratic prediction.
+ Keys on the Player:    R = cycle through send rates (so you don't have to rebuild to test slow updates).
 */
+
+static const char* SmoothingName(SmoothingMode mode) {
+	switch (mode) {
+	case InterpolateOnly: return "Interpolation only";
+	case PredictOnly: return "Prediction only";
+	default: return "Prediction + interpolation";
+	}
+}
+
+static const char* PredictionName(PredictionMethod method) {
+	switch (method) {
+	case None: return "No prediction";
+	case Linear: return "Linear prediction";
+	default: return "Quadratic prediction";
+	}
+}
 
 int main() {
 	bool is_observer = false;
 	unsigned short observer_port = 53000;
 	unsigned short player_port = sf::Socket::AnyPort;
-	const int MAX_HISTORY = 3;
 
 	Utils::printMsg("Game startup...");
 
@@ -52,15 +72,16 @@ int main() {
 	}
 
 	// Prepare window.
-	sf::RenderWindow window(sf::VideoMode({ 640, 480 }), "CMP425/CMP501 - Lab 5: Non-blocking (" + title_type + ")");
+	sf::RenderWindow window(sf::VideoMode({ 640, 480 }), "CMP425/CMP501 - Lab 6: Prediction & Interpolation (" + title_type + ")");
 	window.setFramerateLimit(60);	//Request 60 frames per second
 	Utils::printMsg("Window ready, configuring networking...");
 
 	// Prepare font and text object for debugging text.
 	sf::Font font;
-	font.openFromFile("Assets/Montserrat-Regular.ttf");
+	if (!font.openFromFile("Assets/Montserrat-Regular.ttf"))
+		Utils::printMsg("Could not load the font, the on-screen text will not show.", warning);
 	sf::Text text(font);
-	text.setCharacterSize(24);
+	text.setCharacterSize(18);
 	text.setFillColor(sf::Color::Red);
 	text.setStyle(sf::Text::Bold | sf::Text::Underlined);
 
@@ -87,10 +108,17 @@ int main() {
 	std::vector<Connection> player_connections;
 
 	// Other game parameters.
-	float send_rate = 0.1f;
+	// The Player can cycle through these with R, to test how slow updates look.
+	const float send_rates[] = { 0.1f, 0.25f, 0.5f, 1.f };
+	int send_rate_index = 0;
+	float send_rate = send_rates[send_rate_index];
 	float reconnect_delay = 1.f;
 	float send_timer = 1.f;
 	bool is_connected = false;
+
+	// How the Observer works out where to draw tanks. Change them with the number keys while running.
+	SmoothingMode smoothing_mode = PredictAndInterpolate;
+	PredictionMethod prediction_method = Linear;
 
 	// Selector for handling multiple connections (Observer only).
 	sf::SocketSelector selector;
@@ -100,7 +128,17 @@ int main() {
 		float dt = clock.restart().asSeconds();
 		// Count how much time has passed.
 		game_time += dt;
-		text.setString("Game Time: " + std::to_string(game_time));
+
+		std::string overlay = "Game Time: " + std::to_string(game_time);
+		if (is_observer) {
+			overlay += "\n" + std::string(SmoothingName(smoothing_mode)) + " / " + PredictionName(prediction_method);
+			overlay += "\nKeys 1-3: mode, 4-6: prediction";
+		}
+		else {
+			overlay += "\nSending every " + std::to_string(send_rate) + "s (R to change)";
+		}
+		text.setString(overlay);
+
 		send_timer += dt;
 		// Handle window events (e.g. key press).
 		while (const std::optional event = window.pollEvent()) {
@@ -114,6 +152,28 @@ int main() {
 					Utils::printMsg("ESC pressed, closing window, unbinding socket...", MessageType::warning);
 					window.close();
 					listener.close();
+				}
+
+				// Observer: choose how tanks are drawn.
+				if (is_observer) {
+					bool changed = true;
+					switch (keyPressed->scancode) {
+					case sf::Keyboard::Scancode::Num1: smoothing_mode = InterpolateOnly; break;
+					case sf::Keyboard::Scancode::Num2: smoothing_mode = PredictOnly; break;
+					case sf::Keyboard::Scancode::Num3: smoothing_mode = PredictAndInterpolate; break;
+					case sf::Keyboard::Scancode::Num4: prediction_method = None; break;
+					case sf::Keyboard::Scancode::Num5: prediction_method = Linear; break;
+					case sf::Keyboard::Scancode::Num6: prediction_method = Quadratic; break;
+					default: changed = false; break;
+					}
+					if (changed)
+						Utils::printMsg(std::string("Now using: ") + SmoothingName(smoothing_mode) + " / " + PredictionName(prediction_method), MessageType::info);
+				}
+				// Player: cycle the send rate.
+				else if (keyPressed->scancode == sf::Keyboard::Scancode::R) {
+					send_rate_index = (send_rate_index + 1) % 4;
+					send_rate = send_rates[send_rate_index];
+					Utils::printMsg("Send rate is now every " + std::to_string(send_rate) + " seconds.", MessageType::info);
 				}
 			}
 			// We only handle inputs for the player. Observer will do direct updates from network data.
@@ -150,8 +210,8 @@ int main() {
 				// FIXME: This will only work for the first player. As more player connect, they will be out of sync with the game time. 
 				//		  We should handle this better, e.g. by sending the current game time to the new player and having them start from 
 				//		  that time.
-				if(player_connections.size() == 1)
-					game_time = 0.f; 
+				if (player_connections.size() == 1)
+					game_time = 0.f;
 
 			}
 
@@ -160,7 +220,7 @@ int main() {
 				player_connections[i].state = NotReady;
 
 			// Check which connections have some data waiting to be received from sockets.
-			if (selector.wait(sf::milliseconds(5.f))) {
+			if (selector.wait(sf::milliseconds(5))) {
 				// If at least one of the sockets is ready to receive, check which ones are ready.
 				for (int i = 0; i < player_connections.size(); i++) {
 					if (selector.isReady(*player_connections[i].socket))
@@ -188,13 +248,9 @@ int main() {
 						// handle errors and add error checking here.
 						packet >> message.time >> message.position.x >> message.position.y;
 
-						player_connections[i].inter_t = 0.f; // reset interpolation t value when we get a new message
-
-						// Add message to the message_history
-						player_connections[i].message_history.push_front(message); // newest message added to the front
-						if (player_connections[i].message_history.size() > MAX_HISTORY) {
-							player_connections[i].message_history.pop_back(); // remove the oldest message at the back
-						}
+						// Store the message in the message_history (this also restarts the interpolation
+						// and prediction timers, and starts the correction glide).
+						player_connections[i].AddMessage(message);
 #ifdef DEBUG
 						//For DEBUG ONLY, pring current message history. Remove this when no longer needed!
 						std::string history_msg = "Current queue: \n";
@@ -206,7 +262,7 @@ int main() {
 							history_msg.append(", Y: ");
 							history_msg.append(std::to_string(player_connections[i].message_history[m].position.y));
 							history_msg.append(" }");
-							if (i != (player_connections[i].message_history.size() - 1))
+							if (m != (player_connections[i].message_history.size() - 1))
 								history_msg.append("\n");
 						}
 
@@ -229,17 +285,17 @@ int main() {
 #ifdef DEBUG
 					Utils::printMsg("dt = " + std::to_string(dt) + ", Inter t = " + std::to_string(player_connections[i].inter_t), MessageType::info);
 #endif // DEBUG
-					// Get actual position based on interpolation method.
-					sf::Vector2f interpolated_pos = player_connections[i].Interpolate(dt);
+					// Get the position to draw, using the interpolation / prediction method chosen with the keys.
+					sf::Vector2f display_pos = player_connections[i].GetDisplayPosition(dt, smoothing_mode, prediction_method);
 
 					// Construct message with actual positon.
-					TankMessage interpolated_msg = {
+					TankMessage display_msg = {
 						game_time,
 						player_connections[i].message_history[0].id,
-						interpolated_pos
+						display_pos
 					};
 					// Update game using message containign actual position update.
-					game.NetworkUpdate(dt, interpolated_msg);
+					game.NetworkUpdate(dt, display_msg);
 				}
 			}
 		}
@@ -293,7 +349,6 @@ int main() {
 				}
 			}
 		}
-#pragma endregion
 		// Render
 		window.clear();
 		game.Render(window); // This takes window as a reference.
