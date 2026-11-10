@@ -1,6 +1,7 @@
 #include <SFML\Graphics.hpp>
 #include <SFML\Network.hpp>
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <deque>
 #include <vector>
@@ -24,10 +25,14 @@
  pings, then asks the Observer for the time and sets its own clock to match, allowing for the time the
  reply took to arrive. Because the clocks match, the time on a message can be compared with the
  Observer's clock, and that is what prediction and interpolation use.
+ The Player repeats the latency check and the sync every few seconds, to keep its clock right.
+ Small errors are corrected gradually, so the clock never jumps. Big ones are corrected at once.
 
  Keys on the Observer:  1 = interpolation only, 2 = prediction only, 3 = prediction and interpolation,
 						4 = no prediction, 5 = linear prediction, 6 = quadratic prediction.
  Keys on the Player:    R = cycle through send rates (so you don't have to rebuild to test slow updates).
+						T / Y = TEST ONLY: knock the clock forward by 0.1 s / 1 s, to see it get corrected.
+						U = TEST ONLY: check the latency and resync right now.
 */
 
 static const char* SmoothingName(SmoothingMode mode) {
@@ -174,7 +179,7 @@ int main() {
 
 	// Player: measuring the round trip time (RTT) to the Observer. We send a few pings, one at a time.
 	// The Observer sends each one straight back, and the time that takes is one RTT sample.
-	const std::size_t ping_count = 5;   // How many samples we average over.
+	const std::size_t ping_count = 5;   // How many samples we average over when we first connect.
 	const float ping_timeout = 2.f;     // Give up waiting for a pong after this many seconds.
 	// This clock times one ping at a time. It is separate from game_time, because game_time gets adjusted
 	// when we sync with the Observer, and a clock that jumps would ruin the measurement.
@@ -184,12 +189,27 @@ int main() {
 	std::vector<float> rtt_samples;
 	bool latency_measured = false;
 	float rtt_average = 0.f, rtt_min = 0.f, rtt_max = 0.f;
+	// After the first measurement, each new sample moves the average this far towards itself (0 to 1).
+	const float rtt_smoothing = 0.25f;
 
-	// Player: once the latency is measured we ask the Observer for the time. If no reply comes in time
-	// we ask again.
-	bool sync_requested = false;
+	// Player: asking the Observer for the time, so we can set our clock to match. If no reply comes in
+	// time we ask again.
+	bool needs_sync = false;      // We want to ask the Observer for the time.
+	bool sync_requested = false;  // We have asked, and are waiting for the reply.
 	sf::Clock sync_clock;
 	const float sync_timeout = 2.f;
+
+	// Player: keeping the clock right over time. Every resync_interval seconds we send one more ping, to
+	// check that the latency hasn't changed, and then ask for the time again.
+	const float resync_interval = 5.f;
+	float resync_timer = 0.f;
+	bool resyncing = false;       // One of these later checks is under way.
+	// A clock that is out by less than snap_threshold is corrected gradually, over about slew_time seconds,
+	// so the time never jumps. If it is out by more than that, it is set straight away.
+	const float snap_threshold = 0.25f;
+	const float slew_time = 1.f;
+	float pending_correction = 0.f;  // Seconds of correction still to be added to game_time.
+	float last_clock_error = 0.f;    // How far out the clock was at the last sync, for the on-screen text.
 
 	// How the Observer works out where to draw tanks. Change them with the number keys while running.
 	SmoothingMode smoothing_mode = PredictAndInterpolate;
@@ -224,13 +244,25 @@ int main() {
 			game.RemoveTank(connection.tankId);
 		};
 
+	// Player: sends a ping and starts timing it.
+	auto send_ping = [&]() {
+		sf::Packet ping;
+		ping << static_cast<std::int32_t>(PacketType::Ping) << next_ping_id;
+		outbox.push_back(ping);
+		ping_clock.restart();
+		ping_in_flight = true;
+		};
+
 	// Player: forget the latency measurement and the clock sync, so the next connection starts afresh.
 	auto reset_synchronisation = [&]() {
 		latency_measured = false;
 		ping_in_flight = false;
 		next_ping_id = 0;
 		rtt_samples.clear();
+		needs_sync = false;
 		sync_requested = false;
+		resyncing = false;
+		pending_correction = 0.f;
 		};
 
 	// Player: the connection to the Observer has broken. Go back to trying to connect.
@@ -250,6 +282,19 @@ int main() {
 		// Count how much time has passed.
 		game_time += dt;
 
+		// Player: add a bit of any correction we are still working through, so the clock closes the gap
+		// smoothly instead of jumping. Each frame takes a fraction of what is left, and the fraction is
+		// small enough that game_time still always moves forward.
+		if (pending_correction != 0.f) {
+			float step = pending_correction * std::min(1.f, dt / slew_time);
+			game_time += step;
+			pending_correction -= step;
+			if (std::abs(pending_correction) < 0.0005f) { // Close enough, so finish it off.
+				game_time += pending_correction;
+				pending_correction = 0.f;
+			}
+		}
+
 		std::string overlay = "Game Time: " + std::to_string(game_time);
 		if (is_observer) {
 			overlay += "\n" + std::string(SmoothingName(smoothing_mode)) + " / " + PredictionName(prediction_method);
@@ -265,13 +310,21 @@ int main() {
 				overlay += "\nMeasuring latency... " + std::to_string(rtt_samples.size()) + "/" + std::to_string(ping_count);
 			else {
 				overlay += "\nRTT avg " + FormatMs(rtt_average) + " (min " + FormatMs(rtt_min) + ", max " + FormatMs(rtt_max) + ")";
-				overlay += clock_synced ? "\nClock synced" : "\nSyncing clock...";
+				if (clock_synced) {
+					overlay += "\nClock synced, last error " + FormatMs(last_clock_error);
+					if (resyncing)
+						overlay += "\nChecking latency and resyncing...";
+				}
+				else
+					overlay += "\nSyncing clock...";
 			}
+			overlay += "\nT/Y: knock clock +0.1/+1 s, U: resync now";
 		}
 		text.setString(overlay);
 
 		send_timer += dt;
 		reconnect_timer += dt;
+		resync_timer += dt;
 		// Handle window events (e.g. key press).
 		while (const std::optional event = window.pollEvent()) {
 			if (event->is<sf::Event::Closed>()) {
@@ -306,6 +359,21 @@ int main() {
 					send_rate_index = (send_rate_index + 1) % 4;
 					send_rate = send_rates[send_rate_index];
 					Utils::printMsg("Send rate is now every " + std::to_string(send_rate) + " seconds.", MessageType::info);
+				}
+				// Player, TEST ONLY: knock the clock out of sync, as if it had drifted, to see it get corrected.
+				// Both computers' clocks here are really the same clock, so they never drift apart by themselves.
+				else if (keyPressed->scancode == sf::Keyboard::Scancode::T) {
+					game_time += 0.1f;
+					Utils::printMsg("TEST: clock knocked forward by 0.1 s.", MessageType::warning);
+				}
+				else if (keyPressed->scancode == sf::Keyboard::Scancode::Y) {
+					game_time += 1.f;
+					Utils::printMsg("TEST: clock knocked forward by 1 s.", MessageType::warning);
+				}
+				// Player, TEST ONLY: don't wait for the next check, do it now.
+				else if (keyPressed->scancode == sf::Keyboard::Scancode::U) {
+					resync_timer = resync_interval;
+					Utils::printMsg("TEST: checking the latency and resyncing now.", MessageType::warning);
 				}
 			}
 			// We only handle inputs for the player. Observer will do direct updates from network data.
@@ -570,9 +638,9 @@ int main() {
 							Utils::printMsg("Malformed message from the Observer, ignoring it.", warning);
 							continue;
 						}
-						// We can only allow for the delay if we have measured it.
-						if (!latency_measured) {
-							Utils::printMsg("Got the time before measuring the latency, ignoring it.", warning);
+						// We can only allow for the delay if we have measured it, and only if we asked.
+						if (!latency_measured || !sync_requested) {
+							Utils::printMsg("Got the time when we hadn't asked for it, ignoring it.", warning);
 							continue;
 						}
 
@@ -580,10 +648,37 @@ int main() {
 						// has taken about half the round trip to get here, so the Observer's clock is now about
 						// that much further on. That's the time we want. game_time is the time at the start of
 						// this frame, so we take off the part of the frame that has already passed.
-						game_time = observer_time + rtt_average / 2.f - clock.getElapsedTime().asSeconds();
+						float target_time = observer_time + rtt_average / 2.f - clock.getElapsedTime().asSeconds();
+						// How far out our clock was. Positive means it was behind.
+						float clock_error = target_time - game_time;
+						last_clock_error = clock_error;
+
+						if (!clock_synced) {
+							// The first sync: our clock has nothing to do with the Observer's yet, so just set it.
+							game_time = target_time;
+							pending_correction = 0.f;
+							Utils::printMsg("Clock synced to the Observer (its time was " + std::to_string(observer_time)
+								+ " s, one way delay allowed for " + FormatMs(rtt_average / 2.f) + ").", MessageType::success);
+						}
+						else if (std::abs(clock_error) > snap_threshold) {
+							// Too far out to correct gently, so set it at once.
+							game_time = target_time;
+							pending_correction = 0.f;
+							Utils::printMsg("Clock was out by " + FormatMs(clock_error) + ", too far to correct gradually, so it jumped.", MessageType::warning);
+						}
+						else {
+							// A small error: add it to the clock a little at a time, over the next second or so.
+							// Anything left over from an earlier correction is replaced, because clock_error
+							// already allows for what has been applied.
+							pending_correction = clock_error;
+							Utils::printMsg("Clock was out by " + FormatMs(clock_error) + ", correcting gradually.", MessageType::info);
+						}
+
 						clock_synced = true;
-						Utils::printMsg("Clock synced to the Observer (its time was " + std::to_string(observer_time)
-							+ " s, one way delay allowed for " + FormatMs(rtt_average / 2.f) + ").", MessageType::success);
+						needs_sync = false;
+						sync_requested = false;
+						resyncing = false;
+						resync_timer = 0.f;
 					}
 					else if (type == PacketType::Pong) {
 						std::int32_t pong_id;
@@ -600,25 +695,48 @@ int main() {
 
 						// The time since we sent the ping is one round trip.
 						float rtt = ping_clock.getElapsedTime().asSeconds();
-						rtt_samples.push_back(rtt);
 						ping_in_flight = false;
 						next_ping_id++;
-						Utils::printMsg("Ping " + std::to_string(rtt_samples.size()) + ": " + FormatMs(rtt), MessageType::debug);
 
-						// Once we have enough samples, work out the average (and the smallest and biggest).
-						if (rtt_samples.size() >= ping_count) {
-							float sum = 0.f;
-							rtt_min = rtt_samples[0];
-							rtt_max = rtt_samples[0];
-							for (float sample : rtt_samples) {
-								sum += sample;
-								rtt_min = std::min(rtt_min, sample);
-								rtt_max = std::max(rtt_max, sample);
+						if (!latency_measured) {
+							// Setting up: collect samples until we have enough to average.
+							rtt_samples.push_back(rtt);
+							Utils::printMsg("Ping " + std::to_string(rtt_samples.size()) + ": " + FormatMs(rtt), MessageType::debug);
+
+							// Once we have enough samples, work out the average (and the smallest and biggest).
+							if (rtt_samples.size() >= ping_count) {
+								float sum = 0.f;
+								rtt_min = rtt_samples[0];
+								rtt_max = rtt_samples[0];
+								for (float sample : rtt_samples) {
+									sum += sample;
+									rtt_min = std::min(rtt_min, sample);
+									rtt_max = std::max(rtt_max, sample);
+								}
+								rtt_average = sum / rtt_samples.size();
+								latency_measured = true;
+								needs_sync = true; // Now we know the latency, we can ask for the time.
+								Utils::printMsg("Latency measured: RTT avg " + FormatMs(rtt_average)
+									+ " (min " + FormatMs(rtt_min) + ", max " + FormatMs(rtt_max) + ")", MessageType::success);
 							}
-							rtt_average = sum / rtt_samples.size();
-							latency_measured = true;
-							Utils::printMsg("Latency measured: RTT avg " + FormatMs(rtt_average)
-								+ " (min " + FormatMs(rtt_min) + ", max " + FormatMs(rtt_max) + ")", MessageType::success);
+						}
+						else if (resyncing) {
+							// One of the later checks. If the latency has changed a lot, the old average is no
+							// use for the sync that follows, so trust the new measurement straight away.
+							// Otherwise just move the average a little towards it, so one slow reply doesn't
+							// throw it.
+							if (std::abs(rtt - rtt_average) > std::max(0.03f, 0.5f * rtt_average)) {
+								Utils::printMsg("Latency has changed a lot: " + FormatMs(rtt_average) + " -> " + FormatMs(rtt), MessageType::warning);
+								rtt_average = rtt;
+							}
+							else {
+								rtt_average += rtt_smoothing * (rtt - rtt_average);
+							}
+							rtt_min = std::min(rtt_min, rtt);
+							rtt_max = std::max(rtt_max, rtt);
+							Utils::printMsg("Latency check: " + FormatMs(rtt) + ", average now " + FormatMs(rtt_average), MessageType::debug);
+
+							needs_sync = true; // Now ask for the time again, with the up to date latency.
 						}
 					}
 					else {
@@ -626,14 +744,10 @@ int main() {
 					}
 				}
 
-				// Measure the latency: send one ping at a time, until we have enough samples.
+				// Measure the latency when we first connect: send one ping at a time, until we have enough samples.
 				if (is_connected && !latency_measured) {
 					if (!ping_in_flight) {
-						sf::Packet ping;
-						ping << static_cast<std::int32_t>(PacketType::Ping) << next_ping_id;
-						outbox.push_back(ping);
-						ping_clock.restart();
-						ping_in_flight = true;
+						send_ping();
 					}
 					else if (ping_clock.getElapsedTime().asSeconds() > ping_timeout) {
 						// No reply for too long, so give up on this ping. The next one gets a new number, so a
@@ -644,8 +758,24 @@ int main() {
 					}
 				}
 
-				// Once the latency is measured, ask the Observer for the time so we can sync our clock to it.
-				if (is_connected && latency_measured && !clock_synced) {
+				// Every so often, check the latency again and then resync, to keep the clock right.
+				if (is_connected && latency_measured && clock_synced) {
+					if (!resyncing && resync_timer >= resync_interval) {
+						resyncing = true;
+						send_ping();
+					}
+					else if (resyncing && ping_in_flight && ping_clock.getElapsedTime().asSeconds() > ping_timeout) {
+						// No reply, so skip this check and try again after another interval.
+						Utils::printMsg("Latency check timed out, will try again later.", warning);
+						ping_in_flight = false;
+						next_ping_id++;
+						resyncing = false;
+						resync_timer = 0.f;
+					}
+				}
+
+				// Ask the Observer for the time, whenever we want to sync our clock to it.
+				if (is_connected && needs_sync) {
 					if (!sync_requested) {
 						sf::Packet request;
 						request << static_cast<std::int32_t>(PacketType::SyncRequest);
