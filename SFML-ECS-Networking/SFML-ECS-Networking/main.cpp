@@ -1,6 +1,7 @@
 #include <SFML\Graphics.hpp>
 #include <SFML\Network.hpp>
 #include <algorithm>
+#include <cstdint>
 #include <deque>
 #include <sstream>
 #include <iomanip>
@@ -88,7 +89,7 @@ int main() {
 	}
 
 	// Prepare window.
-	sf::RenderWindow window(sf::VideoMode({ 640, 480 }), "CMP425/CMP501 - Lab 6: Prediction & Interpolation (" + title_type + ")");
+	sf::RenderWindow window(sf::VideoMode({ 640, 480 }), "CMP425/CMP501 - Lab 7: Synchronisation (" + title_type + ")");
 	window.setFramerateLimit(60);	//Request 60 frames per second
 	Utils::printMsg("Window ready, configuring networking...");
 
@@ -275,11 +276,10 @@ int main() {
 				// is always blue. Lab 5 sends it in a separate message.)
 
 				// Tell the new player what time it is on our clock, so every player's timestamps share the
-				// Observer's time (this replaces the old trick of resetting the clock when the first player
-				// connected, which only worked for that one player). It ignores how long the message takes to
-				// arrive, which is tiny here. Over a real network you would take off about half the round trip.
+				// Observer's time. It ignores how long the message takes to arrive, which is tiny on
+				// localhost. (The next steps replace this with a proper measurement.)
 				sf::Packet welcome;
-				welcome << game_time;
+				welcome << static_cast<std::int32_t>(PacketType::TimeSync) << game_time;
 				player_connections.back().outbox.push_back(welcome);
 			}
 
@@ -326,6 +326,17 @@ int main() {
 							+ ":"
 							+ std::to_string(connection.socket->getRemotePort()));
 #endif // DEBUG
+						// Every packet starts with its type, so we know how to read the rest.
+						std::int32_t tag;
+						if (!(packet >> tag)) {
+							Utils::printMsg("Received a packet with no type tag, ignoring it.", warning);
+							continue;
+						}
+						if (static_cast<PacketType>(tag) != PacketType::Update) {
+							Utils::printMsg("Unexpected packet type from a player, ignoring it.", warning);
+							continue;
+						}
+
 						TankMessage message;
 						// Read recieved data into TankMessage struct. Reading can fail if the packet is
 						// too short, so check it before using the values.
@@ -384,7 +395,7 @@ int main() {
 				}
 			}
 
-			// Send out whatever is queued for each player (for now, just the welcome with our clock).
+			// Send out whatever is queued for each player.
 			for (auto& connection : player_connections) {
 				if (connection.state == Disconnected || connection.outbox.empty())
 					continue;
@@ -435,7 +446,7 @@ int main() {
 				}
 			}
 			else {
-				// Listen for the Observer's welcome message, which carries the time on its clock.
+				// Listen for messages from the Observer. For now that is just the time on its clock.
 				while (is_connected) {
 					sf::Packet incoming;
 					sf::Socket::Status status = player_socket->receive(incoming);
@@ -446,6 +457,17 @@ int main() {
 					}
 					if (status != sf::Socket::Status::Done)
 						break; // NotReady, or only part of a packet so far: nothing more to read right now.
+
+					// Every packet starts with its type, so we know how to read the rest.
+					std::int32_t tag;
+					if (!(incoming >> tag)) {
+						Utils::printMsg("Received a packet with no type tag, ignoring it.", warning);
+						continue;
+					}
+					if (static_cast<PacketType>(tag) != PacketType::TimeSync) {
+						Utils::printMsg("Unexpected packet type from the Observer, ignoring it.", warning);
+						continue;
+					}
 
 					float observer_time;
 					if (!(incoming >> observer_time)) {
@@ -474,7 +496,8 @@ int main() {
 						message.time = game_time;
 						// Translate our messgage struct to sf::Packet (very rudimentary conversion).
 						sf::Packet packet;
-						packet << message.time << message.position.x << message.position.y;
+						packet << static_cast<std::int32_t>(PacketType::Update)
+							<< message.time << message.position.x << message.position.y;
 						outbox.push_back(packet);
 						// Reset timer after queueing the message
 						send_timer = 0;
