@@ -20,7 +20,9 @@
  The Observer accepts multiple connections from players, receives their tank position updates,
  and interpolates the tank positions based on message history to provide smooth movement.
  It can also predict where each tank is right now, from the last few positions.
- The Player also measures the round trip time to the Observer, with pings.
+ The Observer's clock is the master clock. A Player measures the round trip time to the Observer with
+ pings, then asks the Observer for the time and sets its own clock to match, allowing for the time the
+ reply took to arrive.
 
  Keys on the Observer:  1 = interpolation only, 2 = prediction only, 3 = prediction and interpolation,
 						4 = no prediction, 5 = linear prediction, 6 = quadratic prediction.
@@ -129,8 +131,11 @@ int main() {
 		Utils::printMsg("Listening on port " + std::to_string(observer_port));
 	}
 
-	// Clock for timing the 'dt' value
+	// Clock for timing the 'dt' value. It restarts every frame, so asking it how much time has passed
+	// tells us how far into the current frame we are.
 	sf::Clock clock;
+	// The time on this program's game clock, as it was at the start of the current frame. On the Observer
+	// this is the master clock. A Player adjusts its own to match it.
 	float game_time = 0;
 
 
@@ -143,6 +148,12 @@ int main() {
 
 	// Container of player connections for Observer.
 	std::vector<Connection> player_connections;
+
+	// Observer: how old the newest message was when it arrived, for the on-screen text. It is the time
+	// on our clock when it arrived, minus the time the player stamped on it. With the clocks in sync,
+	// that is how long the message spent in transit.
+	float latest_message_age = 0.f;
+	bool have_message_age = false;
 
 	// Other game parameters.
 	// The Player can cycle through these with R, to test how slow updates look.
@@ -172,6 +183,12 @@ int main() {
 	std::vector<float> rtt_samples;
 	bool latency_measured = false;
 	float rtt_average = 0.f, rtt_min = 0.f, rtt_max = 0.f;
+
+	// Player: once the latency is measured we ask the Observer for the time. If no reply comes in time
+	// we ask again.
+	bool sync_requested = false;
+	sf::Clock sync_clock;
+	const float sync_timeout = 2.f;
 
 	// How the Observer works out where to draw tanks. Change them with the number keys while running.
 	SmoothingMode smoothing_mode = PredictAndInterpolate;
@@ -206,12 +223,13 @@ int main() {
 			game.RemoveTank(connection.tankId);
 		};
 
-	// Player: forget any latency measurement, so the next connection starts measuring afresh.
-	auto reset_latency_measurement = [&]() {
+	// Player: forget the latency measurement and the clock sync, so the next connection starts afresh.
+	auto reset_synchronisation = [&]() {
 		latency_measured = false;
 		ping_in_flight = false;
 		next_ping_id = 0;
 		rtt_samples.clear();
+		sync_requested = false;
 		};
 
 	// Player: the connection to the Observer has broken. Go back to trying to connect.
@@ -221,7 +239,7 @@ int main() {
 		is_connected = false;
 		clock_synced = false;
 		outbox.clear();
-		reset_latency_measurement();
+		reset_synchronisation();
 		reconnect_timer = 0;
 		};
 
@@ -234,16 +252,20 @@ int main() {
 		std::string overlay = "Game Time: " + std::to_string(game_time);
 		if (is_observer) {
 			overlay += "\n" + std::string(SmoothingName(smoothing_mode)) + " / " + PredictionName(prediction_method);
+			if (have_message_age)
+				overlay += "\nLast message age: " + FormatMs(latest_message_age);
 			overlay += "\nKeys 1-3: mode, 4-6: prediction";
 		}
 		else {
 			overlay += "\nSending every " + std::to_string(send_rate) + "s (R to change)";
 			if (!is_connected)
 				overlay += "\nNot connected";
-			else if (latency_measured)
-				overlay += "\nRTT avg " + FormatMs(rtt_average) + " (min " + FormatMs(rtt_min) + ", max " + FormatMs(rtt_max) + ")";
-			else
+			else if (!latency_measured)
 				overlay += "\nMeasuring latency... " + std::to_string(rtt_samples.size()) + "/" + std::to_string(ping_count);
+			else {
+				overlay += "\nRTT avg " + FormatMs(rtt_average) + " (min " + FormatMs(rtt_min) + ", max " + FormatMs(rtt_max) + ")";
+				overlay += clock_synced ? "\nClock synced" : "\nSyncing clock...";
+			}
 		}
 		text.setString(overlay);
 
@@ -312,12 +334,9 @@ int main() {
 				// where the player's tank really is. (The colour isn't part of these messages, so the tank
 				// is always blue. Lab 5 sends it in a separate message.)
 
-				// Tell the new player what time it is on our clock, so every player's timestamps share the
-				// Observer's time. It ignores how long the message takes to arrive, which is tiny on
-				// localhost. (The next steps replace this with a proper measurement.)
-				sf::Packet welcome;
-				welcome << static_cast<std::int32_t>(PacketType::TimeSync) << game_time;
-				player_connections.back().outbox.push_back(welcome);
+				// We don't send our clock to the new player. It asks for it once it has measured the latency
+				// to us, so it can allow for the time our reply takes. This is also what lets players who
+				// join late sync up: whenever one joins, it asks for the time on our clock as it is then.
 			}
 
 			// Reset states before waiting to avoid stale Ready state causing a blocking receive.
@@ -386,6 +405,17 @@ int main() {
 							continue;
 						}
 
+						// A request for the time: reply with the time on our clock right now. game_time is the
+						// time at the start of this frame, so add the part of the frame that has passed since,
+						// otherwise the time we send would be slightly behind.
+						if (type == PacketType::SyncRequest) {
+							sf::Packet reply;
+							reply << static_cast<std::int32_t>(PacketType::TimeSync)
+								<< (game_time + clock.getElapsedTime().asSeconds());
+							connection.outbox.push_back(reply);
+							continue;
+						}
+
 						if (type != PacketType::Update) {
 							Utils::printMsg("Unexpected packet type from a player, ignoring it.", warning);
 							continue;
@@ -398,6 +428,11 @@ int main() {
 							Utils::printMsg("Malformed packet from a player, ignoring it.", warning);
 							continue;
 						}
+
+						// How long this message took to get here, for the on-screen text. This only makes
+						// sense once the player has synced its clock to ours (which it does before it sends updates).
+						latest_message_age = (game_time + clock.getElapsedTime().asSeconds()) - message.time;
+						have_message_age = true;
 
 						// The first message gives us the tank's real position, so add the tank now.
 						if (connection.tankId < 0) {
@@ -494,7 +529,7 @@ int main() {
 						clock_synced = false;
 						outbox.clear();
 						// Start measuring the latency to this Observer from scratch.
-						reset_latency_measurement();
+						reset_synchronisation();
 					}
 					else {
 						Utils::printMsg("Failed to connect to observer. Will try again later.", MessageType::warning);
@@ -502,7 +537,7 @@ int main() {
 				}
 			}
 			else {
-				// Listen for messages from the Observer: the time on its clock, and replies to our pings.
+				// Listen for messages from the Observer: replies to our pings, and the time on its clock.
 				while (is_connected) {
 					sf::Packet incoming;
 					sf::Socket::Status status = player_socket->receive(incoming);
@@ -528,12 +563,20 @@ int main() {
 							Utils::printMsg("Malformed message from the Observer, ignoring it.", warning);
 							continue;
 						}
+						// We can only allow for the delay if we have measured it.
+						if (!latency_measured) {
+							Utils::printMsg("Got the time before measuring the latency, ignoring it.", warning);
+							continue;
+						}
 
-						// Adopt the Observer's clock, so all of our timestamps are on the same time scale as
-						// every other player's.
-						game_time = observer_time;
+						// observer_time was the time on the Observer's clock when it sent this reply. The reply
+						// has taken about half the round trip to get here, so the Observer's clock is now about
+						// that much further on. That's the time we want. game_time is the time at the start of
+						// this frame, so we take off the part of the frame that has already passed.
+						game_time = observer_time + rtt_average / 2.f - clock.getElapsedTime().asSeconds();
 						clock_synced = true;
-						Utils::printMsg("Clock synced to the Observer.", MessageType::success);
+						Utils::printMsg("Clock synced to the Observer (its time was " + std::to_string(observer_time)
+							+ " s, one way delay allowed for " + FormatMs(rtt_average / 2.f) + ").", MessageType::success);
 					}
 					else if (type == PacketType::Pong) {
 						std::int32_t pong_id;
@@ -591,6 +634,21 @@ int main() {
 						Utils::printMsg("Ping timed out, trying again.", warning);
 						ping_in_flight = false;
 						next_ping_id++;
+					}
+				}
+
+				// Once the latency is measured, ask the Observer for the time so we can sync our clock to it.
+				if (is_connected && latency_measured && !clock_synced) {
+					if (!sync_requested) {
+						sf::Packet request;
+						request << static_cast<std::int32_t>(PacketType::SyncRequest);
+						outbox.push_back(request);
+						sync_clock.restart();
+						sync_requested = true;
+					}
+					else if (sync_clock.getElapsedTime().asSeconds() > sync_timeout) {
+						Utils::printMsg("No reply to the time request, asking again.", warning);
+						sync_requested = false; // The next frame asks again.
 					}
 				}
 
