@@ -22,7 +22,8 @@
  It can also predict where each tank is right now, from the last few positions.
  The Observer's clock is the master clock. A Player measures the round trip time to the Observer with
  pings, then asks the Observer for the time and sets its own clock to match, allowing for the time the
- reply took to arrive.
+ reply took to arrive. Because the clocks match, the time on a message can be compared with the
+ Observer's clock, and that is what prediction and interpolation use.
 
  Keys on the Observer:  1 = interpolation only, 2 = prediction only, 3 = prediction and interpolation,
 						4 = no prediction, 5 = linear prediction, 6 = quadratic prediction.
@@ -429,9 +430,13 @@ int main() {
 							continue;
 						}
 
+						// The time on our clock right now. game_time is the time at the start of this frame,
+						// so add the part of the frame that has passed since.
+						float arrival_time = game_time + clock.getElapsedTime().asSeconds();
+
 						// How long this message took to get here, for the on-screen text. This only makes
 						// sense once the player has synced its clock to ours (which it does before it sends updates).
-						latest_message_age = (game_time + clock.getElapsedTime().asSeconds()) - message.time;
+						latest_message_age = arrival_time - message.time;
 						have_message_age = true;
 
 						// The first message gives us the tank's real position, so add the tank now.
@@ -442,9 +447,10 @@ int main() {
 						// The connection knows which tank is its own, so we don't rely on its position in the vector.
 						message.id = connection.tankId;
 
-						// Store the message in the message_history (this also restarts the interpolation
-						// and prediction timers, and starts the correction glide).
-						connection.AddMessage(message);
+						// Store the message in the message_history. The arrival time lets the connection keep
+						// track of how long messages take to get here, for interpolation, and it also starts
+						// the correction glide.
+						connection.AddMessage(message, arrival_time);
 #ifdef DEBUG
 						//For DEBUG ONLY, pring current message history. Remove this when no longer needed!
 						std::string history_msg = "Current queue: \n";
@@ -471,7 +477,8 @@ int main() {
 					Utils::printMsg("dt = " + std::to_string(dt) + ", Inter t = " + std::to_string(connection.inter_t), MessageType::info);
 #endif // DEBUG
 					// Get the position to draw, using the interpolation / prediction method chosen with the keys.
-					sf::Vector2f display_pos = connection.GetDisplayPosition(dt, smoothing_mode, prediction_method);
+					// game_time is the Observer's clock, which the messages' time stamps are now measured against.
+					sf::Vector2f display_pos = connection.GetDisplayPosition(dt, game_time, smoothing_mode, prediction_method);
 
 					// Construct message with actual positon.
 					TankMessage display_msg = {

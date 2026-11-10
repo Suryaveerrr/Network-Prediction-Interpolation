@@ -11,7 +11,7 @@ enum PredictionMethod { None, Linear, Quadratic, Cubic };
 
 // How the Observer works out where to draw a tank.
 enum SmoothingMode {
-	InterpolateOnly,        // Glide between the last two known positions. Smooth, but a whole update behind.
+	InterpolateOnly,        // Glide between known positions, a little in the past. Smooth, but behind.
 	PredictOnly,            // Draw the predicted position. Up to date, but jumps when a prediction was wrong.
 	PredictAndInterpolate   // Draw the predicted position, but glide from the old guess to the corrected one.
 };
@@ -28,6 +28,10 @@ inline sf::Vector2f Lerp(sf::Vector2f v0, sf::Vector2f v1, float t)
 }
 
 // Everything the Observer knows about one connected player, including which tank is theirs.
+//
+// All the times here are on the Observer's game clock. The player's clock is synchronised to it, so the
+// time stamped on a message by the player can be compared directly with "now" on the Observer.
+//
 // This could also be made int oa class, given the increased functionality.
 struct Connection
 {
@@ -38,6 +42,8 @@ struct Connection
 	static constexpr float MAX_PREDICTION_TIME = 1.f;
 	// How long, in seconds, the drawn position takes to glide to the corrected prediction after a new message.
 	static constexpr float CORRECTION_TIME = 0.2f;
+	// How quickly age_estimate follows each new measurement: 0 would never change, 1 would always be the newest.
+	static constexpr float AGE_SMOOTHING = 0.25f;
 
 	std::unique_ptr<sf::TcpSocket> socket;
 	ConnState state = Disconnected;
@@ -52,12 +58,11 @@ struct Connection
 	std::deque<sf::Packet> outbox;
 
 	std::deque<TankMessage> message_history; // Newest message at the front.
-	float inter_t = 0.f; // This value goes from 0.f to 1.f during interpolation and will be accumulated based on time delta.
+	float inter_t = 0.f; // Where the last interpolation was between its two messages: 0 = the older one, 1 = the newer one.
 
-	// Seconds since the newest message arrived, measured on the Observer's own clock. We can't work this
-	// out from the timestamps in the messages, because those come from the Player's clock, which isn't
-	// the same as ours.
-	float time_since_message = 0.f;
+	// A smoothed estimate of how old a message is when it reaches us, which is about how long it spends
+	// in transit. We work it out from the time stamps on the messages, now the clocks are in sync.
+	float age_estimate = 0.f;
 
 	// Where the tank was last drawn, and the correction that glides from the old drawn position to the
 	// newly predicted one after each message.
@@ -65,8 +70,14 @@ struct Connection
 	sf::Vector2f correction_start = { 0.f, 0.f };
 	float correction_t = 1.f; // 0 = just started correcting, 1 = finished.
 
-	// Store a newly received message and restart the timers that depend on it.
-	void AddMessage(const TankMessage& message) {
+	// Store a newly received message. arrival_time is the time on our clock when it arrived.
+	void AddMessage(const TankMessage& message, float arrival_time) {
+		// How old the message already was when it got here. It is never negative (if it looks it, the
+		// clocks are slightly out and we treat it as 0), and we smooth it so one slow message doesn't
+		// throw the estimate.
+		float age = std::max(arrival_time - message.time, 0.f);
+		age_estimate = message_history.empty() ? age : age_estimate + AGE_SMOOTHING * (age - age_estimate);
+
 		if (message_history.empty()) {
 			// First message: there is nothing to glide from, so start right on it.
 			displayed_position = message.position;
@@ -78,27 +89,27 @@ struct Connection
 			correction_t = 0.f;
 		}
 
-		inter_t = 0.f; // reset interpolation t value when we get a new message
-		time_since_message = 0.f;
-
 		message_history.push_front(message); // newest message added to the front
 		if (message_history.size() > MAX_HISTORY)
 			message_history.pop_back(); // remove the oldest message at the back
 	}
 
-	// Guess where the tank is right now, from the messages we have. Needs at least one message.
-	sf::Vector2f Predict(PredictionMethod method) const {
+	// Guess where the tank is at the time "now" (on our clock), from the messages we have.
+	// Needs at least one message.
+	sf::Vector2f Predict(PredictionMethod method, float now) const {
 		const TankMessage& newest = message_history[0];
 
 		// No prediction, or not enough history to predict from: just the last known position.
 		if (method == None || message_history.size() < 2)
 			return newest.position;
 
-		// How far ahead of the newest message we are predicting (capped, see MAX_PREDICTION_TIME).
-		float t = std::min(time_since_message, MAX_PREDICTION_TIME);
+		// How long ago the newest position was true. That's the time the message spent in transit, plus
+		// the time since it arrived, so we predict all the way up to now. (We used to count only from
+		// when it arrived, which left the tank behind by the transit time.) It is capped, see
+		// MAX_PREDICTION_TIME.
+		float t = std::clamp(now - newest.time, 0.f, MAX_PREDICTION_TIME);
 
-		// Velocity from the last two positions. The times come from the Player's clock, but we only use
-		// the difference between them, so the clocks don't need to match.
+		// Velocity from the last two positions, using the times the player stamped on them.
 		float dt_new = newest.time - message_history[1].time;
 		if (dt_new <= 0.f)
 			return newest.position; // No usable time gap, so no usable velocity.
@@ -122,51 +133,55 @@ struct Connection
 		return newest.position + velocity_new * t + acceleration * (0.5f * t * t);
 	}
 
-	// Interpolate position based on selected method and value of t. Return TankMessage with updated position.
-	sf::Vector2f Interpolate(float dt) {
-		// Calculate interpolation step: the fraction of the time between the last two messages
-		// that this frame covers.
-		float step = 0.f;
+	// Interpolate between known positions, drawing the tank as it was a little while ago, at the
+	// time "now" minus a delay (all on our clock).
+	sf::Vector2f Interpolate(float now) {
+		// With only one message there is nothing to interpolate between.
+		if (message_history.size() < 2)
+			return message_history[0].position;
 
-		if (message_history.size() > 1) { // Make sure we have at least 2 messages for Linear interpolation.
-			float gap = message_history[0].time - message_history[1].time;
-			// If the timestamps are equal (or out of order) there is no usable gap to interpolate across,
-			// so jump straight to the newest position instead of dividing by zero.
-			step = (gap > 0.f) ? dt / gap : 1.f;
+		// How far back? Far enough that the newest message has had time to arrive (the age estimate),
+		// plus one gap between messages, so that when a new message arrives we are just starting on the
+		// stretch that ends at it. Then there are always messages on both sides of the time we draw.
+		float gap = std::max(message_history[0].time - message_history[1].time, 0.f);
+		float render_time = now - (age_estimate + gap);
+
+		// Find the pair of messages that render_time falls between, starting with the newest pair.
+		for (std::size_t i = 0; i + 1 < message_history.size(); i++) {
+			const TankMessage& newer = message_history[i];
+			const TankMessage& older = message_history[i + 1];
+
+			if (render_time >= older.time) {
+				float span = newer.time - older.time;
+				// How far through this pair we are. If render_time is past the newest message (the next one
+				// is late) it stays at 1, so the tank waits at the newest position.
+				// If the two messages have the same time there is nothing to interpolate across.
+				inter_t = (span > 0.f) ? std::clamp((render_time - older.time) / span, 0.f, 1.f) : 1.f;
+				return Lerp(older.position, newer.position, inter_t);
+			}
 		}
 
-		// Add step to inter_t
-		inter_t += step;
-
-		// Clamp inter_t to max of 1.f
-		if (inter_t > 1.f)
-			inter_t = 1.f;
-
-		if (message_history.size() > 1) { // Make sure we have at least 2 messages for Linear interpolation.
-			// Calculate new position by interpolating between last two known positons.
-			return Lerp(message_history[1].position, message_history[0].position, inter_t);
-		}
-		else
-			return message_history[0].position; // Just return the last known position.
+		// render_time is older than everything we remember, so show the oldest position we have.
+		inter_t = 0.f;
+		return message_history.back().position;
 	}
 
 	// Work out where to draw the tank this frame. Call once per frame, and only when we have a message.
-	sf::Vector2f GetDisplayPosition(float dt, SmoothingMode mode, PredictionMethod method) {
-		time_since_message += dt;
-
+	// "now" is the time on the Observer's clock, and dt is the time since the last frame.
+	sf::Vector2f GetDisplayPosition(float dt, float now, SmoothingMode mode, PredictionMethod method) {
 		sf::Vector2f position;
 
 		if (mode == InterpolateOnly) {
-			position = Interpolate(dt);
+			position = Interpolate(now);
 		}
 		else if (mode == PredictOnly) {
-			position = Predict(method);
+			position = Predict(method, now);
 		}
 		else {
 			// PredictAndInterpolate: the target is the prediction for right now, which keeps moving as
 			// time passes. After a new message the target may be somewhere else than where we were
 			// drawing the tank, so glide from the old drawn position to the target instead of snapping.
-			sf::Vector2f target = Predict(method);
+			sf::Vector2f target = Predict(method, now);
 			correction_t = std::min(correction_t + dt / CORRECTION_TIME, 1.f);
 			position = Lerp(correction_start, target, correction_t);
 		}
