@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <deque>
+#include <vector>
 #include <sstream>
 #include <iomanip>
 #include "game.h"
@@ -19,6 +20,7 @@
  The Observer accepts multiple connections from players, receives their tank position updates,
  and interpolates the tank positions based on message history to provide smooth movement.
  It can also predict where each tank is right now, from the last few positions.
+ The Player also measures the round trip time to the Observer, with pings.
 
  Keys on the Observer:  1 = interpolation only, 2 = prediction only, 3 = prediction and interpolation,
 						4 = no prediction, 5 = linear prediction, 6 = quadratic prediction.
@@ -39,6 +41,13 @@ static const char* PredictionName(PredictionMethod method) {
 	case Linear: return "Linear prediction";
 	default: return "Quadratic prediction";
 	}
+}
+
+// Turns a time in seconds into text in milliseconds, e.g. 0.0334 -> "33.4 ms".
+static std::string FormatMs(float seconds) {
+	std::ostringstream stream;
+	stream << std::fixed << std::setprecision(1) << seconds * 1000.f << " ms";
+	return stream.str();
 }
 
 // Sends as much of the queue as the socket will take right now, front to back. A packet is only removed
@@ -151,6 +160,19 @@ int main() {
 	std::deque<sf::Packet> outbox;
 	const std::size_t max_queued_updates = 4;
 
+	// Player: measuring the round trip time (RTT) to the Observer. We send a few pings, one at a time.
+	// The Observer sends each one straight back, and the time that takes is one RTT sample.
+	const std::size_t ping_count = 5;   // How many samples we average over.
+	const float ping_timeout = 2.f;     // Give up waiting for a pong after this many seconds.
+	// This clock times one ping at a time. It is separate from game_time, because game_time gets adjusted
+	// when we sync with the Observer, and a clock that jumps would ruin the measurement.
+	sf::Clock ping_clock;
+	std::int32_t next_ping_id = 0;
+	bool ping_in_flight = false;
+	std::vector<float> rtt_samples;
+	bool latency_measured = false;
+	float rtt_average = 0.f, rtt_min = 0.f, rtt_max = 0.f;
+
 	// How the Observer works out where to draw tanks. Change them with the number keys while running.
 	SmoothingMode smoothing_mode = PredictAndInterpolate;
 	PredictionMethod prediction_method = Linear;
@@ -184,6 +206,14 @@ int main() {
 			game.RemoveTank(connection.tankId);
 		};
 
+	// Player: forget any latency measurement, so the next connection starts measuring afresh.
+	auto reset_latency_measurement = [&]() {
+		latency_measured = false;
+		ping_in_flight = false;
+		next_ping_id = 0;
+		rtt_samples.clear();
+		};
+
 	// Player: the connection to the Observer has broken. Go back to trying to connect.
 	auto lose_connection = [&](const std::string& reason) {
 		Utils::printMsg(reason + " Will try to reconnect.", error);
@@ -191,6 +221,7 @@ int main() {
 		is_connected = false;
 		clock_synced = false;
 		outbox.clear();
+		reset_latency_measurement();
 		reconnect_timer = 0;
 		};
 
@@ -207,6 +238,12 @@ int main() {
 		}
 		else {
 			overlay += "\nSending every " + std::to_string(send_rate) + "s (R to change)";
+			if (!is_connected)
+				overlay += "\nNot connected";
+			else if (latency_measured)
+				overlay += "\nRTT avg " + FormatMs(rtt_average) + " (min " + FormatMs(rtt_min) + ", max " + FormatMs(rtt_max) + ")";
+			else
+				overlay += "\nMeasuring latency... " + std::to_string(rtt_samples.size()) + "/" + std::to_string(ping_count);
 		}
 		text.setString(overlay);
 
@@ -332,7 +369,24 @@ int main() {
 							Utils::printMsg("Received a packet with no type tag, ignoring it.", warning);
 							continue;
 						}
-						if (static_cast<PacketType>(tag) != PacketType::Update) {
+						PacketType type = static_cast<PacketType>(tag);
+
+						// A ping: send it straight back, with the same number, so the player can time the round trip.
+						// This is queued now and goes out at the end of this frame, so the reply is as quick
+						// as we can make it.
+						if (type == PacketType::Ping) {
+							std::int32_t ping_id;
+							if (!(packet >> ping_id)) {
+								Utils::printMsg("Malformed Ping packet, ignoring it.", warning);
+								continue;
+							}
+							sf::Packet pong;
+							pong << static_cast<std::int32_t>(PacketType::Pong) << ping_id;
+							connection.outbox.push_back(pong);
+							continue;
+						}
+
+						if (type != PacketType::Update) {
 							Utils::printMsg("Unexpected packet type from a player, ignoring it.", warning);
 							continue;
 						}
@@ -439,6 +493,8 @@ int main() {
 						// We start sending once we have the Observer's clock.
 						clock_synced = false;
 						outbox.clear();
+						// Start measuring the latency to this Observer from scratch.
+						reset_latency_measurement();
 					}
 					else {
 						Utils::printMsg("Failed to connect to observer. Will try again later.", MessageType::warning);
@@ -446,7 +502,7 @@ int main() {
 				}
 			}
 			else {
-				// Listen for messages from the Observer. For now that is just the time on its clock.
+				// Listen for messages from the Observer: the time on its clock, and replies to our pings.
 				while (is_connected) {
 					sf::Packet incoming;
 					sf::Socket::Status status = player_socket->receive(incoming);
@@ -464,22 +520,78 @@ int main() {
 						Utils::printMsg("Received a packet with no type tag, ignoring it.", warning);
 						continue;
 					}
-					if (static_cast<PacketType>(tag) != PacketType::TimeSync) {
+					PacketType type = static_cast<PacketType>(tag);
+
+					if (type == PacketType::TimeSync) {
+						float observer_time;
+						if (!(incoming >> observer_time)) {
+							Utils::printMsg("Malformed message from the Observer, ignoring it.", warning);
+							continue;
+						}
+
+						// Adopt the Observer's clock, so all of our timestamps are on the same time scale as
+						// every other player's.
+						game_time = observer_time;
+						clock_synced = true;
+						Utils::printMsg("Clock synced to the Observer.", MessageType::success);
+					}
+					else if (type == PacketType::Pong) {
+						std::int32_t pong_id;
+						if (!(incoming >> pong_id)) {
+							Utils::printMsg("Malformed Pong packet, ignoring it.", warning);
+							continue;
+						}
+						// Only the reply to the ping we are waiting for counts. Anything else is a late reply
+						// to a ping we gave up on.
+						if (!ping_in_flight || pong_id != next_ping_id) {
+							Utils::printMsg("Ignoring an old Pong.", warning);
+							continue;
+						}
+
+						// The time since we sent the ping is one round trip.
+						float rtt = ping_clock.getElapsedTime().asSeconds();
+						rtt_samples.push_back(rtt);
+						ping_in_flight = false;
+						next_ping_id++;
+						Utils::printMsg("Ping " + std::to_string(rtt_samples.size()) + ": " + FormatMs(rtt), MessageType::debug);
+
+						// Once we have enough samples, work out the average (and the smallest and biggest).
+						if (rtt_samples.size() >= ping_count) {
+							float sum = 0.f;
+							rtt_min = rtt_samples[0];
+							rtt_max = rtt_samples[0];
+							for (float sample : rtt_samples) {
+								sum += sample;
+								rtt_min = std::min(rtt_min, sample);
+								rtt_max = std::max(rtt_max, sample);
+							}
+							rtt_average = sum / rtt_samples.size();
+							latency_measured = true;
+							Utils::printMsg("Latency measured: RTT avg " + FormatMs(rtt_average)
+								+ " (min " + FormatMs(rtt_min) + ", max " + FormatMs(rtt_max) + ")", MessageType::success);
+						}
+					}
+					else {
 						Utils::printMsg("Unexpected packet type from the Observer, ignoring it.", warning);
-						continue;
 					}
+				}
 
-					float observer_time;
-					if (!(incoming >> observer_time)) {
-						Utils::printMsg("Malformed message from the Observer, ignoring it.", warning);
-						continue;
+				// Measure the latency: send one ping at a time, until we have enough samples.
+				if (is_connected && !latency_measured) {
+					if (!ping_in_flight) {
+						sf::Packet ping;
+						ping << static_cast<std::int32_t>(PacketType::Ping) << next_ping_id;
+						outbox.push_back(ping);
+						ping_clock.restart();
+						ping_in_flight = true;
 					}
-
-					// Adopt the Observer's clock, so all of our timestamps are on the same time scale as
-					// every other player's.
-					game_time = observer_time;
-					clock_synced = true;
-					Utils::printMsg("Clock synced to the Observer.", MessageType::success);
+					else if (ping_clock.getElapsedTime().asSeconds() > ping_timeout) {
+						// No reply for too long, so give up on this ping. The next one gets a new number, so a
+						// late reply to this one can't be mistaken for it.
+						Utils::printMsg("Ping timed out, trying again.", warning);
+						ping_in_flight = false;
+						next_ping_id++;
+					}
 				}
 
 				// Don't send anything until we have the Observer's clock, or our timestamps would
